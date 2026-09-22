@@ -1,0 +1,487 @@
+##############################################
+# STEP_H01 — DATA PREPARATION (Horizon Paper)
+##############################################
+library(readxl)
+library(dplyr)
+library(glmnet)
+library(ranger)
+library(writexl)
+library(ggplot2)
+library(tidyr)
+
+MIN_YEARS <- 10
+
+DATA_DIR_OPTION1 <- "C:/Users/Alper.Tosun/Desktop/cru130"
+DATA_DIR_OPTION2 <- "C:/Users/autos/OneDrive/Desktop/cru130"
+
+if (dir.exists(DATA_DIR_OPTION1)) {
+  DATA_DIR <- DATA_DIR_OPTION1
+} else if (dir.exists(DATA_DIR_OPTION2)) {
+  DATA_DIR <- DATA_DIR_OPTION2
+} else {
+  stop("Neither DATA_DIR_OPTION1 nor DATA_DIR_OPTION2 exists. Please check the paths.")
+}
+cat("Using DATA_DIR:", DATA_DIR, "\n")
+
+OUTPUT_DIR <- file.path(DATA_DIR, "horizonpaper")
+if (!dir.exists(OUTPUT_DIR)) dir.create(OUTPUT_DIR, recursive = TRUE)
+FIGURES_DIR <- file.path(OUTPUT_DIR, "figures")
+if (!dir.exists(FIGURES_DIR)) dir.create(FIGURES_DIR, recursive = TRUE)
+cat("Using OUTPUT_DIR:", OUTPUT_DIR, "\n")
+
+prepare_crop_data <- function(crop_name) {
+  file_path <- file.path(DATA_DIR, paste0("panelv7_", crop_name, ".xlsx"))
+  df <- read_excel(file_path)
+
+  df <- df %>%
+    mutate(
+      log_yield = log(yield_hg_per_ha),
+      log_gdp   = log(GDP_per_Capita)
+    ) %>%
+    filter(!is.na(log_yield), !is.na(TMX_ann), !is.na(PRE_ann), !is.na(log_gdp))
+
+  country_coverage <- df %>%
+    group_by(Country_ISO) %>%
+    summarise(n_years = n(), .groups = "drop")
+
+  good_countries <- country_coverage %>% filter(n_years >= MIN_YEARS) %>% pull(Country_ISO)
+  df <- df %>% filter(Country_ISO %in% good_countries)
+  return(df)
+}
+
+##############################################
+# STEP_H02 — FEASIBILITY
+##############################################
+L_VALUES <- c(10, 20, 30, 40, 50)
+H_VALUES <- c(1, 3, 5, 10)
+
+get_valid_origins <- function(df, L, h) {
+  yr_min <- min(df$Yil); yr_max <- max(df$Yil)
+  T_start <- yr_min + L - 1
+  T_end   <- yr_max - h
+  if (T_end < T_start) return(integer(0))
+  return(T_start:T_end)
+}
+
+# Common origins: the origin set that is valid for EVERY L in L_VALUES,
+# for a given h. Since larger L pushes T_start later, the common start
+# is governed by the LARGEST L being tested.
+get_common_origins <- function(df, h, L_set = L_VALUES) {
+  yr_min <- min(df$Yil); yr_max <- max(df$Yil)
+  T_start_common <- yr_min + max(L_set) - 1
+  T_end_common   <- yr_max - h
+  if (T_end_common < T_start_common) return(integer(0))
+  return(T_start_common:T_end_common)
+}
+
+build_feasibility_table <- function(df) {
+  results <- list(); i <- 1
+  for (L in L_VALUES) {
+    for (h in H_VALUES) {
+      origins <- get_valid_origins(df, L, h)
+      results[[i]] <- data.frame(L = L, h = h, n_origins = length(origins),
+                                  feasible = length(origins) >= 3)
+      i <- i + 1
+    }
+  }
+  bind_rows(results)
+}
+
+##############################################
+# STEP_H03 — CORE FITTING FUNCTION
+##############################################
+# Fits Elastic Net (optionally with country fixed effects and/or
+# country-balanced training weights) for one (crop, L, h, origin, seed,
+# feature_set) cell, and returns COUNTRY-LEVEL errors (not a single
+# pooled RMSE) so that evaluation aggregation can be done either way
+# (pooled or equal-country-weighted) downstream.
+
+N_SEEDS   <- 15
+RF_TREES  <- 150
+
+# Four feature sets for the ablation (Test 3 in the plan)
+FEATURE_SETS <- list(
+  persistence_only = c("log_yield"),
+  yield_gdp        = c("log_yield", "log_gdp"),
+  yield_climate     = c("log_yield", "TMX_ann", "PRE_ann"),
+  full              = c("log_yield", "TMX_ann", "PRE_ann", "log_gdp")
+)
+
+build_training_pairs <- function(df, s_years, h) {
+  pair_list <- list()
+  for (s in s_years) {
+    features_s <- df %>% filter(Yil == s)
+    target_s   <- df %>% filter(Yil == s + h) %>% select(Country_ISO, target = log_yield)
+    pair_list[[length(pair_list) + 1]] <- features_s %>% inner_join(target_s, by = "Country_ISO")
+  }
+  if (length(pair_list) == 0) return(NULL)
+  bind_rows(pair_list)
+}
+
+# Builds a numeric design matrix, optionally adding one-hot country
+# fixed effects. train_countries fixes which country dummy columns
+# exist, so the test matrix always has the exact same columns as train
+# (a country present in test but absent from train gets an all-zero
+# dummy row, which is the correct FE behavior for an unseen level).
+build_design_matrix <- function(data, feature_cols, use_country_fe, train_countries = NULL) {
+  X_num <- as.matrix(data[, feature_cols, drop = FALSE])
+
+  if (!use_country_fe) return(X_num)
+
+  if (is.null(train_countries)) train_countries <- sort(unique(data$Country_ISO))
+  fe <- sapply(train_countries, function(cty) as.numeric(data$Country_ISO == cty))
+  colnames(fe) <- paste0("cty_", train_countries)
+  cbind(X_num, fe)
+}
+
+# Fits one cell and returns COUNTRY-LEVEL squared errors (long format)
+# for the model, persistence, and historical-mean benchmarks.
+fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
+                                   feature_set_name = "full",
+                                   use_country_fe = FALSE,
+                                   country_balanced_weights = FALSE,
+                                   also_fit_extratrees = FALSE) {
+
+  set.seed(seed)
+  feature_cols <- FEATURE_SETS[[feature_set_name]]
+
+  s_years <- (T_origin - L + 1):(T_origin - h)
+  train <- build_training_pairs(df, s_years, h)
+  if (is.null(train) || nrow(train) < 20) return(NULL)
+
+  features_T <- df %>% filter(Yil == T_origin)
+  target_T   <- df %>% filter(Yil == T_origin + h) %>% select(Country_ISO, target = log_yield)
+  test <- features_T %>% inner_join(target_T, by = "Country_ISO")
+  if (nrow(test) == 0) return(NULL)
+
+  train_countries <- sort(unique(train$Country_ISO))
+  X_train <- build_design_matrix(train, feature_cols, use_country_fe, train_countries)
+  y_train <- train$target
+  X_test  <- build_design_matrix(test, feature_cols, use_country_fe, train_countries)
+  y_test  <- test$target
+
+  # Optional country-balanced training weights (Test 4, robustness only —
+  # this balances the ESTIMATION objective; it is NOT the same as
+  # country-balanced EVALUATION, which is handled separately below)
+  if (country_balanced_weights) {
+    n_i <- table(train$Country_ISO)
+    w <- 1 / as.numeric(n_i[train$Country_ISO])
+  } else {
+    w <- rep(1, nrow(train))
+  }
+
+  # glmnet requires a design matrix with >= 2 columns; the
+  # "persistence_only" feature set (just log_yield) has only 1, so we
+  # fall back to plain (weighted) linear regression in that single-
+  # predictor case - mathematically consistent with Elastic Net's
+  # limiting behavior when there is nothing to regularize between.
+  if (ncol(X_train) < 2) {
+    lm_fit  <- lm(y_train ~ X_train, weights = w)
+    en_pred <- as.numeric(cbind(1, X_test) %*% coef(lm_fit))
+  } else {
+    en_fit  <- cv.glmnet(X_train, y_train, alpha = 0.5, nfolds = 5, weights = w)
+    en_pred <- as.numeric(predict(en_fit, newx = X_test, s = "lambda.min"))
+  }
+
+  # --- Extra Trees, ONLY as a robustness check on the main analysis ---
+  # (not run for ablation, balanced-weights, or common-origin, to avoid
+  # turning this into a model-comparison study; uses the ORIGINAL
+  # numeric features, not the FE dummy matrix, since tree splits on
+  # ~100 near-collinear country dummies would be slow and uninformative)
+  if (also_fit_extratrees) {
+    rf_train_data <- as.data.frame(cbind(train[, feature_cols, drop = FALSE], target = y_train))
+    rf_fit  <- ranger(target ~ ., data = rf_train_data, num.trees = RF_TREES, splitrule = "extratrees")
+    rf_pred <- predict(rf_fit, data = as.data.frame(test[, feature_cols, drop = FALSE]))$predictions
+  } else {
+    rf_pred <- rep(NA_real_, nrow(test))
+  }
+
+  # Historical-mean benchmark (per country, from the training window)
+  hist_mean_by_country <- train %>% group_by(Country_ISO) %>%
+    summarise(hist_mean = mean(target), .groups = "drop")
+  test_hm <- test %>% left_join(hist_mean_by_country, by = "Country_ISO")
+
+  # Return COUNTRY-LEVEL squared errors, long format: one row per
+  # (country, origin, seed) with errors for all three approaches.
+  # Downstream aggregation decides whether to average across countries
+  # (equal-country weight) or pool across all rows (pooled weight).
+  data.frame(
+    Country_ISO = test$Country_ISO,
+    L = L, h = h, T_origin = T_origin, seed = seed,
+    feature_set = feature_set_name, country_fe = use_country_fe,
+    balanced_weights = country_balanced_weights,
+    sq_err_model    = (en_pred - y_test)^2,
+    sq_err_rf       = (rf_pred - y_test)^2,   # NA when also_fit_extratrees = FALSE
+    sq_err_persist  = (test$log_yield - y_test)^2,
+    sq_err_histmean = (test_hm$hist_mean - y_test)^2
+  )
+}
+
+##############################################
+# STEP_H04 — ANALYSIS A: MAXIMUM-ORIGIN GRID (main analysis)
+##############################################
+# Uses every feasible origin for each (L,h) separately (as before), but
+# now returns country-level errors and aggregates TWO ways downstream:
+# pooled and equal-country-weighted (two-stage). Checkpointed per crop.
+
+run_full_grid <- function(df, feas_table, crop_name, feature_set_name = "full",
+                           use_country_fe = FALSE, country_balanced_weights = FALSE,
+                           also_fit_extratrees = FALSE) {
+
+  feasible_cells <- feas_table %>% filter(feasible)
+  tag <- paste0(feature_set_name, "_fe", as.integer(use_country_fe), "_bw", as.integer(country_balanced_weights))
+  ckpt_dir <- file.path(OUTPUT_DIR, paste0("checkpoints_", crop_name, "_", tag))
+  if (!dir.exists(ckpt_dir)) dir.create(ckpt_dir, recursive = TRUE)
+
+  for (i in seq_len(nrow(feasible_cells))) {
+    L <- feasible_cells$L[i]; h <- feasible_cells$h[i]
+    ckpt_file <- file.path(ckpt_dir, paste0("cell_L", L, "_h", h, ".rds"))
+    if (file.exists(ckpt_file)) { cat("Skipping (done): L=", L, " h=", h, "\n"); next }
+
+    origins <- get_valid_origins(df, L, h)
+    cell_results <- list()
+    for (T_origin in origins) {
+      for (seed in 1:N_SEEDS) {
+        res <- fit_one_cell_one_seed(df, L, h, T_origin, seed, feature_set_name,
+                                      use_country_fe, country_balanced_weights,
+                                      also_fit_extratrees)
+        if (!is.null(res)) cell_results[[length(cell_results) + 1]] <- res
+      }
+    }
+    saveRDS(bind_rows(cell_results), ckpt_file)
+    cat("Finished: L=", L, " h=", h, "\n")
+  }
+
+  ckpt_files <- list.files(ckpt_dir, pattern = "\\.rds$", full.names = TRUE)
+  bind_rows(lapply(ckpt_files, readRDS))
+}
+
+# Aggregates country-level errors two ways: pooled and equal-country.
+# If sq_err_rf is present and non-NA (i.e. Extra Trees was fit), also
+# computes RF-based skill columns alongside the Elastic Net ones.
+aggregate_two_ways <- function(country_level_errors) {
+
+  has_rf <- "sq_err_rf" %in% names(country_level_errors) &&
+            !all(is.na(country_level_errors$sq_err_rf))
+
+  pooled <- country_level_errors %>%
+    group_by(L, h) %>%
+    summarise(
+      rmse_model_pooled    = sqrt(mean(sq_err_model)),
+      rmse_persist_pooled  = sqrt(mean(sq_err_persist)),
+      rmse_histmean_pooled = sqrt(mean(sq_err_histmean)),
+      rmse_rf_pooled       = if (has_rf) sqrt(mean(sq_err_rf, na.rm = TRUE)) else NA_real_,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      skill_pooled_persist  = 1 - rmse_model_pooled / rmse_persist_pooled,
+      skill_pooled_histmean = 1 - rmse_model_pooled / rmse_histmean_pooled,
+      skill_rf_pooled_persist = if (has_rf) 1 - rmse_rf_pooled / rmse_persist_pooled else NA_real_
+    )
+
+  balanced_by_country <- country_level_errors %>%
+    group_by(L, h, Country_ISO) %>%
+    summarise(
+      rmse_i_model    = sqrt(mean(sq_err_model)),
+      rmse_i_persist  = sqrt(mean(sq_err_persist)),
+      rmse_i_histmean = sqrt(mean(sq_err_histmean)),
+      rmse_i_rf       = if (has_rf) sqrt(mean(sq_err_rf, na.rm = TRUE)) else NA_real_,
+      .groups = "drop"
+    )
+
+  balanced <- balanced_by_country %>%
+    group_by(L, h) %>%
+    summarise(
+      rmse_model_balanced    = mean(rmse_i_model),
+      rmse_persist_balanced  = mean(rmse_i_persist),
+      rmse_histmean_balanced = mean(rmse_i_histmean),
+      rmse_rf_balanced       = if (has_rf) mean(rmse_i_rf, na.rm = TRUE) else NA_real_,
+      .groups = "drop"
+    ) %>%
+    mutate(
+      skill_balanced_persist  = 1 - rmse_model_balanced / rmse_persist_balanced,
+      skill_balanced_histmean = 1 - rmse_model_balanced / rmse_histmean_balanced,
+      skill_rf_balanced_persist = if (has_rf) 1 - rmse_rf_balanced / rmse_persist_balanced else NA_real_
+    )
+
+  left_join(pooled, balanced, by = c("L", "h"))
+}
+
+##############################################
+# STEP_H05 — ANALYSIS B: COMMON-ORIGIN SENSITIVITY CHECK
+##############################################
+# NOT the main analysis. This holds the forecast-origin set FIXED and
+# identical across all L values (governed by the largest L), so that
+# any remaining difference across L cannot be attributed to a shifting
+# evaluation period. Used only to check that the Analysis A "L effect"
+# is not a temporal-composition artifact.
+
+run_common_origin_analysis <- function(df, h, crop_name, feature_set_name = "full") {
+
+  ckpt_file <- file.path(OUTPUT_DIR, paste0("ckpt_common_origin_", crop_name, "_h", h, ".rds"))
+  if (file.exists(ckpt_file)) {
+    cat("Skipping common-origin h =", h, "(already done)\n")
+    return(readRDS(ckpt_file))
+  }
+
+  common_origins <- get_common_origins(df, h)
+  if (length(common_origins) < 3) {
+    cat("Too few common origins for h =", h, "- skipping (data-limited).\n")
+    saveRDS(NULL, ckpt_file)   # remember that this h was checked, not just missed
+    return(NULL)
+  }
+
+  all_rows <- list()
+  for (L in L_VALUES) {
+    for (T_origin in common_origins) {
+      for (seed in 1:N_SEEDS) {
+        res <- fit_one_cell_one_seed(df, L, h, T_origin, seed, feature_set_name)
+        if (!is.null(res)) all_rows[[length(all_rows) + 1]] <- res
+      }
+    }
+  }
+  country_level <- bind_rows(all_rows)
+  if (nrow(country_level) == 0) return(NULL)
+
+  agg <- aggregate_two_ways(country_level)
+  agg$n_common_origins <- length(common_origins)
+  agg$analysis <- "common_origin_sensitivity"
+
+  # Paired difference test (persistence loss minus model loss, per
+  # origin, aggregated across countries) - a origin-level paired sign
+  # test, appropriate given only a handful of common origins.
+  paired_by_origin <- country_level %>%
+    group_by(L, T_origin) %>%
+    summarise(
+      loss_persist = sqrt(mean(sq_err_persist)),
+      loss_model   = sqrt(mean(sq_err_model)),
+      .groups = "drop"
+    ) %>%
+    mutate(d = loss_persist - loss_model)   # positive d = model beats persistence at this origin
+
+  sign_test_by_L <- paired_by_origin %>%
+    group_by(L) %>%
+    summarise(
+      n_origins = n(),
+      n_positive = sum(d > 0),
+      p_value = tryCatch(binom.test(sum(d > 0), n())$p.value, error = function(e) NA_real_),
+      .groups = "drop"
+    )
+
+  result <- list(aggregated = agg, paired_origin_level = paired_by_origin, sign_test = sign_test_by_L)
+  saveRDS(result, ckpt_file)   # save so this h is never recomputed if the script restarts
+  return(result)
+}
+
+##############################################
+# STEP_H06 — DRIVER: RUNS ALL 8 CROPS (main + ablation + common-origin)
+##############################################
+CROPS <- c("wheat", "barley", "oats", "rye", "rice", "maize", "soybean", "sorghum")
+
+run_one_crop <- function(crop_name) {
+
+  # This marker is written ONLY after every analysis (main, ablation,
+  # balanced weights, common-origin) has finished for this crop - using
+  # summary_<crop>.xlsx here would be wrong, since that file is written
+  # much earlier (right after the main analysis) and would cause a
+  # restart to skip the crop before the ablation/common-origin parts
+  # ever ran.
+  done_marker <- file.path(OUTPUT_DIR, paste0("DONE_", crop_name, ".txt"))
+  if (file.exists(done_marker)) {
+    cat("\n===== SKIPPING (fully done):", crop_name, "=====\n")
+    return(invisible(NULL))
+  }
+
+  cat("\n===== STARTING:", crop_name, "=====\n")
+  df   <- prepare_crop_data(crop_name)
+  feas <- build_feasibility_table(df)
+  write_xlsx(feas, file.path(OUTPUT_DIR, paste0("feasibility_", crop_name, ".xlsx")))
+
+  # --- Analysis A: main grid, full feature set, with country FE,
+  #     PLUS Extra Trees as a one-time robustness check (not run
+  #     anywhere else in the pipeline) ---
+  # NOTE: country fixed effects removed from the main analysis. The
+  # earlier version (use_country_fe = TRUE here) caused a large,
+  # spurious reversal of the h-effect finding - traced to instability
+  # from cv.glmnet regularizing ~100+ country dummies jointly with the
+  # 4 substantive predictors. Country-FE is no longer used anywhere in
+  # the main pipeline; only country-BALANCED EVALUATION (two-stage
+  # aggregation in aggregate_two_ways) is kept, which is what was
+  # actually intended.
+  main_country_level <- run_full_grid(df, feas, crop_name, feature_set_name = "full",
+                                       use_country_fe = FALSE, also_fit_extratrees = TRUE)
+  main_summary <- aggregate_two_ways(main_country_level)
+  main_summary$analysis <- "analysis_A_max_origins"
+  write_xlsx(main_summary, file.path(OUTPUT_DIR, paste0("summary_", crop_name, ".xlsx")))
+
+  # --- Feature ablation (Elastic Net only, main grid, no country FE
+  #     to keep the ablation comparison simple and fast) ---
+  ablation_results <- list()
+  for (fset in names(FEATURE_SETS)) {
+    cl <- run_full_grid(df, feas, crop_name, feature_set_name = fset, use_country_fe = FALSE)
+    summ <- aggregate_two_ways(cl)
+    summ$feature_set <- fset
+    ablation_results[[fset]] <- summ
+  }
+  ablation_summary <- bind_rows(ablation_results)
+  write_xlsx(ablation_summary, file.path(OUTPUT_DIR, paste0("ablation_", crop_name, ".xlsx")))
+
+  # --- Robustness: country-balanced TRAINING weights (glmnet weights = 1/n_i),
+  #     full feature set, NO country-FE (kept separate from the FE issue above) ---
+  bw_country_level <- run_full_grid(df, feas, crop_name, feature_set_name = "full",
+                                     use_country_fe = FALSE, country_balanced_weights = TRUE)
+  bw_summary <- aggregate_two_ways(bw_country_level)
+  write_xlsx(bw_summary, file.path(OUTPUT_DIR, paste0("balanced_weights_", crop_name, ".xlsx")))
+
+  # --- Analysis B: common-origin sensitivity check, one per h ---
+  common_origin_all_h <- list()
+  for (h in H_VALUES) {
+    res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full")
+    if (!is.null(res)) common_origin_all_h[[as.character(h)]] <- res$aggregated
+  }
+  if (length(common_origin_all_h) > 0) {
+    write_xlsx(bind_rows(common_origin_all_h),
+               file.path(OUTPUT_DIR, paste0("common_origin_", crop_name, ".xlsx")))
+  }
+
+  writeLines("done", done_marker)   # only NOW is this crop truly finished
+  cat("===== DONE:", crop_name, "=====\n")
+}
+
+for (crop in CROPS) run_one_crop(crop)
+
+# Combine main summaries across all crops
+combined_summary <- bind_rows(lapply(CROPS, function(cn) {
+  p <- file.path(OUTPUT_DIR, paste0("summary_", cn, ".xlsx"))
+  if (file.exists(p)) readxl::read_excel(p) %>% mutate(crop = cn, .before = 1) else NULL
+}))
+write_xlsx(combined_summary, file.path(OUTPUT_DIR, "summary_ALL_CROPS.xlsx"))
+
+cat("\n\nALL CROPS FINISHED. Output is in:", OUTPUT_DIR, "\n")
+
+##############################################
+# STEP_H07 — FIGURES
+##############################################
+# Figure 1: per-crop heatmap (equal-country-balanced skill vs persistence)
+fig1 <- ggplot(combined_summary, aes(x = factor(h), y = factor(L), fill = skill_balanced_persist)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.0f%%", skill_balanced_persist * 100)), size = 2.8) +
+  scale_fill_gradient(low = "#E6F1FB", high = "#185FA5", name = "Skill relative\nto persistence",
+                       labels = scales::percent_format(accuracy = 1)) +
+  facet_wrap(~ crop, ncol = 4) +
+  labs(x = "Forecast horizon (h, years)", y = "History length (L, years)") +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid = element_blank())
+
+ggsave(file.path(FIGURES_DIR, "Fig1_skill_heatmap_by_crop.pdf"), fig1, width = 11, height = 6, units = "in")
+ggsave(file.path(FIGURES_DIR, "Fig1_skill_heatmap_by_crop.png"), fig1, width = 11, height = 6, units = "in", dpi = 1600)
+
+cat("\n\nFigures saved (PDF + 1600 dpi PNG) in:", FIGURES_DIR, "\n")
+
+##############################################
+# END OF STEP_H01 - STEP_H07
+# Outputs per crop: summary_<crop>.xlsx (Analysis A, main),
+# ablation_<crop>.xlsx (feature ablation), balanced_weights_<crop>.xlsx
+# (training-weight robustness), common_origin_<crop>.xlsx (Analysis B,
+# sensitivity check only - NOT for confirmatory L-effect claims).
+##############################################
