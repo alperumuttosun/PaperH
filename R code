@@ -229,7 +229,9 @@ run_full_grid <- function(df, feas_table, crop_name, feature_set_name = "full",
                            also_fit_extratrees = FALSE) {
 
   feasible_cells <- feas_table %>% filter(feasible)
-  tag <- paste0(feature_set_name, "_fe", as.integer(use_country_fe), "_bw", as.integer(country_balanced_weights))
+  tag <- paste0(feature_set_name, "_fe", as.integer(use_country_fe),
+                "_bw", as.integer(country_balanced_weights),
+                "_rf", as.integer(also_fit_extratrees))
   ckpt_dir <- file.path(OUTPUT_DIR, paste0("checkpoints_", crop_name, "_", tag))
   if (!dir.exists(ckpt_dir)) dir.create(ckpt_dir, recursive = TRUE)
 
@@ -395,7 +397,7 @@ run_one_crop <- function(crop_name) {
   cat("\n===== STARTING:", crop_name, "=====\n")
   df   <- prepare_crop_data(crop_name)
   feas <- build_feasibility_table(df)
-  write_xlsx(feas, file.path(OUTPUT_DIR, paste0("feasibility_", crop_name, ".xlsx")))
+  saveRDS(feas, file.path(OUTPUT_DIR, paste0("_tmp_feasibility_", crop_name, ".rds")))
 
   # --- Analysis A: main grid, full feature set, with country FE,
   #     PLUS Extra Trees as a one-time robustness check (not run
@@ -412,7 +414,7 @@ run_one_crop <- function(crop_name) {
                                        use_country_fe = FALSE, also_fit_extratrees = TRUE)
   main_summary <- aggregate_two_ways(main_country_level)
   main_summary$analysis <- "analysis_A_max_origins"
-  write_xlsx(main_summary, file.path(OUTPUT_DIR, paste0("summary_", crop_name, ".xlsx")))
+  saveRDS(main_summary, file.path(OUTPUT_DIR, paste0("_tmp_summary_", crop_name, ".rds")))
 
   # --- Feature ablation (Elastic Net only, main grid, no country FE
   #     to keep the ablation comparison simple and fast) ---
@@ -424,14 +426,17 @@ run_one_crop <- function(crop_name) {
     ablation_results[[fset]] <- summ
   }
   ablation_summary <- bind_rows(ablation_results)
-  write_xlsx(ablation_summary, file.path(OUTPUT_DIR, paste0("ablation_", crop_name, ".xlsx")))
+  # Kept only as an intermediate (not sent to you): combined into one
+  # multi-sheet workbook (ablation_ALL_CROPS.xlsx) after all crops finish.
+  saveRDS(ablation_summary, file.path(OUTPUT_DIR, paste0("_tmp_ablation_", crop_name, ".rds")))
 
   # --- Robustness: country-balanced TRAINING weights (glmnet weights = 1/n_i),
   #     full feature set, NO country-FE (kept separate from the FE issue above) ---
   bw_country_level <- run_full_grid(df, feas, crop_name, feature_set_name = "full",
                                      use_country_fe = FALSE, country_balanced_weights = TRUE)
   bw_summary <- aggregate_two_ways(bw_country_level)
-  write_xlsx(bw_summary, file.path(OUTPUT_DIR, paste0("balanced_weights_", crop_name, ".xlsx")))
+  # Kept only as an intermediate: combined into balanced_weights_ALL_CROPS.xlsx after the crop loop.
+  saveRDS(bw_summary, file.path(OUTPUT_DIR, paste0("_tmp_balanced_weights_", crop_name, ".rds")))
 
   # --- Analysis B: common-origin sensitivity check, one per h ---
   common_origin_all_h <- list()
@@ -440,8 +445,9 @@ run_one_crop <- function(crop_name) {
     if (!is.null(res)) common_origin_all_h[[as.character(h)]] <- res$aggregated
   }
   if (length(common_origin_all_h) > 0) {
-    write_xlsx(bind_rows(common_origin_all_h),
-               file.path(OUTPUT_DIR, paste0("common_origin_", crop_name, ".xlsx")))
+    # Kept only as an intermediate: combined into common_origin_ALL_CROPS.xlsx after the crop loop.
+    saveRDS(bind_rows(common_origin_all_h),
+            file.path(OUTPUT_DIR, paste0("_tmp_common_origin_", crop_name, ".rds")))
   }
 
   writeLines("done", done_marker)   # only NOW is this crop truly finished
@@ -450,12 +456,36 @@ run_one_crop <- function(crop_name) {
 
 for (crop in CROPS) run_one_crop(crop)
 
-# Combine main summaries across all crops
+# Combine main summaries across all crops (stacked rows, single sheet -
+# this is the format that turned out to be most convenient to work with)
 combined_summary <- bind_rows(lapply(CROPS, function(cn) {
-  p <- file.path(OUTPUT_DIR, paste0("summary_", cn, ".xlsx"))
-  if (file.exists(p)) readxl::read_excel(p) %>% mutate(crop = cn, .before = 1) else NULL
+  p <- file.path(OUTPUT_DIR, paste0("_tmp_summary_", cn, ".rds"))
+  if (file.exists(p)) readRDS(p) %>% mutate(crop = cn, .before = 1) else NULL
 }))
 write_xlsx(combined_summary, file.path(OUTPUT_DIR, "summary_ALL_CROPS.xlsx"))
+
+# Combine feasibility and the three secondary analyses into ONE
+# multi-sheet workbook each (one sheet per crop) instead of 8 separate
+# files per analysis type.
+build_multisheet_workbook <- function(tmp_prefix, out_filename) {
+  sheets <- list()
+  for (cn in CROPS) {
+    p <- file.path(OUTPUT_DIR, paste0(tmp_prefix, cn, ".rds"))
+    if (file.exists(p)) sheets[[cn]] <- readRDS(p)
+  }
+  if (length(sheets) > 0) {
+    write_xlsx(sheets, file.path(OUTPUT_DIR, out_filename))
+  }
+}
+
+build_multisheet_workbook("_tmp_feasibility_", "feasibility_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_ablation_", "ablation_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_balanced_weights_", "balanced_weights_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_common_origin_", "common_origin_ALL_CROPS.xlsx")
+
+# Clean up the intermediate per-crop .rds files now that the combined
+# workbooks exist
+invisible(file.remove(list.files(OUTPUT_DIR, pattern = "^_tmp_.*\\.rds$", full.names = TRUE)))
 
 cat("\n\nALL CROPS FINISHED. Output is in:", OUTPUT_DIR, "\n")
 
@@ -480,8 +510,10 @@ cat("\n\nFigures saved (PDF + 1600 dpi PNG) in:", FIGURES_DIR, "\n")
 
 ##############################################
 # END OF STEP_H01 - STEP_H07
-# Outputs per crop: summary_<crop>.xlsx (Analysis A, main),
-# ablation_<crop>.xlsx (feature ablation), balanced_weights_<crop>.xlsx
-# (training-weight robustness), common_origin_<crop>.xlsx (Analysis B,
-# sensitivity check only - NOT for confirmatory L-effect claims).
+# Final outputs (4 files total, not per-crop):
+#   summary_ALL_CROPS.xlsx          - Analysis A, main result, all crops as rows
+#   ablation_ALL_CROPS.xlsx         - feature ablation, one sheet per crop
+#   balanced_weights_ALL_CROPS.xlsx - training-weight robustness, one sheet per crop
+#   common_origin_ALL_CROPS.xlsx    - Analysis B sensitivity check, one sheet per
+#                                      crop (NOT for confirmatory L-effect claims)
 ##############################################
