@@ -52,8 +52,10 @@ prepare_crop_data <- function(crop_name) {
 ##############################################
 # STEP_H02 — FEASIBILITY
 ##############################################
-L_VALUES <- c(10, 20, 30, 40, 50)
+L_VALUES <- c(10, 20, 30, 40, 50)   # full grid (L=50 used only as a sensitivity check, see below)
+L_VALUES_PRIMARY <- c(10, 20, 30, 40)   # primary common-origin grid (L=50 excluded - see Step_H05)
 H_VALUES <- c(1, 3, 5, 10)
+MIN_TRAIN_SAMPLE <- 10   # minimum n_train = L-h; cells below this are excluded everywhere
 
 get_valid_origins <- function(df, L, h) {
   yr_min <- min(df$Yil); yr_max <- max(df$Yil)
@@ -80,7 +82,7 @@ build_feasibility_table <- function(df) {
     for (h in H_VALUES) {
       origins <- get_valid_origins(df, L, h)
       results[[i]] <- data.frame(L = L, h = h, n_origins = length(origins),
-                                  feasible = length(origins) >= 3)
+                                  feasible = (length(origins) >= 3) && ((L - h) >= MIN_TRAIN_SAMPLE))
       i <- i + 1
     }
   }
@@ -145,7 +147,18 @@ fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
   set.seed(seed)
   feature_cols <- FEATURE_SETS[[feature_set_name]]
 
+  # Guard against L <= h: (T-L+1):(T-h) would otherwise count DOWNWARD
+  # in R (e.g. L=10,h=10 gives a descending 2-element sequence instead
+  # of the empty set it should be), silently fabricating bogus training
+  # pairs. This also gets caught by MIN_TRAIN_SAMPLE below, but we
+  # guard here explicitly so the bug can never produce wrong output.
+  if (L <= h) return(NULL)
   s_years <- (T_origin - L + 1):(T_origin - h)
+
+  # Minimum effective training sample size (n_train = L - h). Cells
+  # below this are closer to an extreme-undertraining experiment than
+  # a forecasting exercise (GPT critique, round 3) and are excluded.
+  if (length(s_years) < MIN_TRAIN_SAMPLE) return(NULL)
   train <- build_training_pairs(df, s_years, h)
   if (is.null(train) || nrow(train) < 20) return(NULL)
 
@@ -318,23 +331,24 @@ aggregate_two_ways <- function(country_level_errors) {
 # evaluation period. Used only to check that the Analysis A "L effect"
 # is not a temporal-composition artifact.
 
-run_common_origin_analysis <- function(df, h, crop_name, feature_set_name = "full") {
+run_common_origin_analysis <- function(df, h, crop_name, feature_set_name = "full",
+                                        L_set = L_VALUES_PRIMARY, tag = "primary") {
 
-  ckpt_file <- file.path(OUTPUT_DIR, paste0("ckpt_common_origin_", crop_name, "_h", h, ".rds"))
+  ckpt_file <- file.path(OUTPUT_DIR, paste0("ckpt_common_origin_", crop_name, "_h", h, "_", tag, ".rds"))
   if (file.exists(ckpt_file)) {
-    cat("Skipping common-origin h =", h, "(already done)\n")
+    cat("Skipping common-origin h =", h, "(", tag, ", already done)\n")
     return(readRDS(ckpt_file))
   }
 
-  common_origins <- get_common_origins(df, h)
+  common_origins <- get_common_origins(df, h, L_set = L_set)
   if (length(common_origins) < 3) {
-    cat("Too few common origins for h =", h, "- skipping (data-limited).\n")
+    cat("Too few common origins for h =", h, "(", tag, ") - skipping (data-limited).\n")
     saveRDS(NULL, ckpt_file)   # remember that this h was checked, not just missed
     return(NULL)
   }
 
   all_rows <- list()
-  for (L in L_VALUES) {
+  for (L in L_set) {
     for (T_origin in common_origins) {
       for (seed in 1:N_SEEDS) {
         res <- fit_one_cell_one_seed(df, L, h, T_origin, seed, feature_set_name)
@@ -347,7 +361,7 @@ run_common_origin_analysis <- function(df, h, crop_name, feature_set_name = "ful
 
   agg <- aggregate_two_ways(country_level)
   agg$n_common_origins <- length(common_origins)
-  agg$analysis <- "common_origin_sensitivity"
+  agg$analysis <- tag
 
   # Paired difference test (persistence loss minus model loss, per
   # origin, aggregated across countries) - a origin-level paired sign
@@ -438,16 +452,67 @@ run_one_crop <- function(crop_name) {
   # Kept only as an intermediate: combined into balanced_weights_ALL_CROPS.xlsx after the crop loop.
   saveRDS(bw_summary, file.path(OUTPUT_DIR, paste0("_tmp_balanced_weights_", crop_name, ".rds")))
 
-  # --- Analysis B: common-origin sensitivity check, one per h ---
-  common_origin_all_h <- list()
+  # --- Analysis B1: common-origin, PRIMARY grid (L=10,20,30,40 - L=50
+  #     excluded here because it shrinks h=10 to only 5 common origins;
+  #     see Analysis B2 below for the L=50 sensitivity check) ---
+  common_origin_primary <- list()
+  paired_origin_primary <- list()
   for (h in H_VALUES) {
-    res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full")
-    if (!is.null(res)) common_origin_all_h[[as.character(h)]] <- res$aggregated
+    res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full",
+                                       L_set = L_VALUES_PRIMARY, tag = "primary")
+    if (!is.null(res)) {
+      common_origin_primary[[as.character(h)]] <- res$aggregated
+      paired_origin_primary[[as.character(h)]] <- res$paired_origin_level %>% mutate(h = h, .before = 1)
+    }
   }
-  if (length(common_origin_all_h) > 0) {
-    # Kept only as an intermediate: combined into common_origin_ALL_CROPS.xlsx after the crop loop.
-    saveRDS(bind_rows(common_origin_all_h),
+  if (length(common_origin_primary) > 0) {
+    saveRDS(bind_rows(common_origin_primary),
             file.path(OUTPUT_DIR, paste0("_tmp_common_origin_", crop_name, ".rds")))
+    # Origin-level paired differences (persistence loss - model loss),
+    # one row per (L, origin) - lets you SEE whether an "L effect" is a
+    # consistent pattern across origins or driven by one or two of them.
+    saveRDS(bind_rows(paired_origin_primary),
+            file.path(OUTPUT_DIR, paste0("_tmp_paired_origin_", crop_name, ".rds")))
+  }
+
+  # --- Analysis B2: L=50 sensitivity - same common-origin design, but
+  #     comparing only L=40 vs L=50 (so the origin set is governed by
+  #     L=50 as before; kept separate and clearly labeled as a
+  #     small-sample sensitivity check, not part of the primary result) ---
+  common_origin_L50 <- list()
+  for (h in H_VALUES) {
+    res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full",
+                                       L_set = c(40, 50), tag = "L50_sensitivity")
+    if (!is.null(res)) common_origin_L50[[as.character(h)]] <- res$aggregated
+  }
+  if (length(common_origin_L50) > 0) {
+    saveRDS(bind_rows(common_origin_L50),
+            file.path(OUTPUT_DIR, paste0("_tmp_common_origin_L50sens_", crop_name, ".rds")))
+  }
+
+  # --- Analysis B3: common-country sensitivity - restricts to countries
+  #     with FULL temporal coverage (all 64 years), so that comparing
+  #     across L cannot be confounded by which countries happen to have
+  #     enough history for a given L (GPT critique, round 3) ---
+  full_coverage_countries <- df %>% group_by(Country_ISO) %>%
+    summarise(n_years = n(), .groups = "drop") %>%
+    filter(n_years == max(n_years)) %>% pull(Country_ISO)
+  df_common_country <- df %>% filter(Country_ISO %in% full_coverage_countries)
+
+  common_country_results <- list()
+  for (h in H_VALUES) {
+    res <- run_common_origin_analysis(df_common_country, h, paste0(crop_name, "_cc"),
+                                       feature_set_name = "full",
+                                       L_set = L_VALUES_PRIMARY, tag = "common_country")
+    if (!is.null(res)) {
+      r <- res$aggregated
+      r$n_countries_used <- length(full_coverage_countries)
+      common_country_results[[as.character(h)]] <- r
+    }
+  }
+  if (length(common_country_results) > 0) {
+    saveRDS(bind_rows(common_country_results),
+            file.path(OUTPUT_DIR, paste0("_tmp_common_country_", crop_name, ".rds")))
   }
 
   writeLines("done", done_marker)   # only NOW is this crop truly finished
@@ -482,6 +547,9 @@ build_multisheet_workbook("_tmp_feasibility_", "feasibility_ALL_CROPS.xlsx")
 build_multisheet_workbook("_tmp_ablation_", "ablation_ALL_CROPS.xlsx")
 build_multisheet_workbook("_tmp_balanced_weights_", "balanced_weights_ALL_CROPS.xlsx")
 build_multisheet_workbook("_tmp_common_origin_", "common_origin_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_paired_origin_", "paired_origin_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_common_origin_L50sens_", "common_origin_L50sensitivity_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_common_country_", "common_country_ALL_CROPS.xlsx")
 
 # Clean up the intermediate per-crop .rds files now that the combined
 # workbooks exist
@@ -509,11 +577,25 @@ ggsave(file.path(FIGURES_DIR, "Fig1_skill_heatmap_by_crop.png"), fig1, width = 1
 cat("\n\nFigures saved (PDF + 1600 dpi PNG) in:", FIGURES_DIR, "\n")
 
 ##############################################
-# END OF STEP_H01 - STEP_H07
-# Final outputs (4 files total, not per-crop):
-#   summary_ALL_CROPS.xlsx          - Analysis A, main result, all crops as rows
-#   ablation_ALL_CROPS.xlsx         - feature ablation, one sheet per crop
-#   balanced_weights_ALL_CROPS.xlsx - training-weight robustness, one sheet per crop
-#   common_origin_ALL_CROPS.xlsx    - Analysis B sensitivity check, one sheet per
-#                                      crop (NOT for confirmatory L-effect claims)
+# END OF STEP_H01 - STEP_H07 (v3)
+# Final outputs (not per-crop):
+#   summary_ALL_CROPS.xlsx                    - Analysis A, max-origin grid (L=10..50)
+#   feasibility_ALL_CROPS.xlsx                - feasibility table, one sheet per crop
+#   ablation_ALL_CROPS.xlsx                   - feature ablation, one sheet per crop
+#   balanced_weights_ALL_CROPS.xlsx           - training-weight robustness
+#   common_origin_ALL_CROPS.xlsx              - Analysis B1, PRIMARY common-origin
+#                                                grid (L=10,20,30,40 only)
+#   paired_origin_ALL_CROPS.xlsx              - origin-level paired differences
+#                                                underlying B1 (persist - model loss
+#                                                per L, origin - lets you see whether
+#                                                the L effect is consistent across
+#                                                origins or driven by 1-2 of them)
+#   common_origin_L50sensitivity_ALL_CROPS.xlsx - Analysis B2, L=40 vs L=50 only,
+#                                                on their own (narrower) common-origin
+#                                                set - L=50 kept OUT of the primary
+#                                                grid, reported here separately
+#   common_country_ALL_CROPS.xlsx             - Analysis B3, same as B1 but restricted
+#                                                to countries with full 64-year coverage
+#                                                (controls for country-composition
+#                                                confound alongside the origin confound)
 ##############################################
