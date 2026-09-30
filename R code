@@ -106,7 +106,12 @@ FEATURE_SETS <- list(
   persistence_only = c("log_yield"),
   yield_gdp        = c("log_yield", "log_gdp"),
   yield_climate     = c("log_yield", "TMX_ann", "PRE_ann"),
-  full              = c("log_yield", "TMX_ann", "PRE_ann", "log_gdp")
+  full              = c("log_yield", "TMX_ann", "PRE_ann", "log_gdp"),
+  # GPT round 6, go/no-go test #1: gives Elastic Net the SAME
+  # within-window trend slope that the drift benchmark uses, as an
+  # explicit feature - so the comparison "drift beats Elastic Net" is
+  # not simply because Elastic Net was never given that information.
+  full_plus_trend   = c("log_yield", "TMX_ann", "PRE_ann", "log_gdp", "recent_slope")
 )
 
 build_training_pairs <- function(df, s_years, h) {
@@ -144,7 +149,14 @@ fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
                                    country_balanced_weights = FALSE,
                                    also_fit_extratrees = FALSE,
                                    min_train_sample = MIN_TRAIN_SAMPLE,
-                                   demean_within_window = FALSE) {
+                                   transform_type = "raw",
+                                   paired_countries = FALSE) {
+  # transform_type: "raw" (no transform), "demean" (leakage-free
+  # within-window country-mean removal, i.e. removes LEVEL only - see
+  # GPT round 5 critique: this is NOT detrending), or "detrend"
+  # (leakage-free within-window country-specific LINEAR TREND removal,
+  # which also removes the level as a special case). Both demean and
+  # detrend estimate their parameters ONLY from [T-L+1, T].
 
   set.seed(seed)
   feature_cols <- FEATURE_SETS[[feature_set_name]]
@@ -160,10 +172,6 @@ fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
   # Minimum effective training sample size (n_train = L - h). Cells
   # below this are closer to an extreme-undertraining experiment than
   # a forecasting exercise (GPT critique, round 3) and are excluded.
-  # min_train_sample defaults to the global MIN_TRAIN_SAMPLE, but a
-  # caller (e.g. the L=10 sensitivity check below) can pass a lower,
-  # explicit value - never silently, always visible in that analysis's
-  # own labeling.
   if (length(s_years) < min_train_sample) return(NULL)
   train <- build_training_pairs(df, s_years, h)
   if (is.null(train) || nrow(train) < 20) return(NULL)
@@ -173,28 +181,104 @@ fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
   test <- features_T %>% inner_join(target_T, by = "Country_ISO")
   if (nrow(test) == 0) return(NULL)
 
-  # LEAKAGE-FREE within-country demeaning (Analysis C3). Each country's
-  # mean log-yield is computed ONLY from observations inside the
-  # window [T-L+1, T] - i.e. information genuinely available at the
-  # forecast origin - and subtracted from both the predictor
-  # (log_yield) and the target. This removes between-country LEVEL
-  # differences while using no post-origin information (unlike the
-  # earlier full-series demeaning in Analysis C2, which used all
-  # 1961-2024 data). The persistence benchmark is unaffected by the
-  # shift (the mean cancels in y_{T+h} - y_T), so skill remains
-  # directly comparable to every other analysis.
-  if (demean_within_window) {
-    win_means <- df %>%
-      filter(Yil >= T_origin - L + 1, Yil <= T_origin) %>%
-      group_by(Country_ISO) %>%
-      summarise(cm = mean(log_yield), .groups = "drop")
-    train <- train %>% left_join(win_means, by = "Country_ISO") %>%
-      filter(!is.na(cm)) %>%
-      mutate(log_yield = log_yield - cm, target = target - cm)
-    test <- test %>% left_join(win_means, by = "Country_ISO") %>%
-      filter(!is.na(cm)) %>%
-      mutate(log_yield = log_yield - cm, target = target - cm)
+  # The window's own raw data, used both for demean/detrend parameter
+  # estimation AND for the drift/AR(1) benchmarks below (so every
+  # benchmark and the model itself operate on a CONSISTENT
+  # representation of the series).
+  win_data <- df %>% filter(Yil >= T_origin - L + 1, Yil <= T_origin) %>%
+    arrange(Country_ISO, Yil)
+
+  # GPT round 6, go/no-go test #2: restrict to the country set that
+  # would be ELIGIBLE UNDER DETREND (>= 3 distinct years in the
+  # window, needed for a stable slope) even when running raw or
+  # demean - so a raw-vs-demean-vs-detrend comparison is never
+  # confounded by a shifting country composition across the three.
+  if (paired_countries) {
+    eligible_countries <- win_data %>% group_by(Country_ISO) %>%
+      summarise(n_obs = n(), .groups = "drop") %>%
+      filter(n_obs >= 3) %>% pull(Country_ISO)
+    win_data <- win_data %>% filter(Country_ISO %in% eligible_countries)
+    train <- train %>% filter(Country_ISO %in% eligible_countries)
+    test  <- test  %>% filter(Country_ISO %in% eligible_countries)
     if (nrow(train) < 20 || nrow(test) == 0) return(NULL)
+  }
+
+  # recent_slope: same two-point within-window slope used by the drift
+  # benchmark, but also exposed as a MODEL FEATURE (for the
+  # "full_plus_trend" feature set) so Elastic Net can use it directly -
+  # this is the actual go/no-go test #1 fix.
+  recent_slope_by_country <- win_data %>% group_by(Country_ISO) %>%
+    summarise(
+      recent_slope = if (n() >= 2 && max(Yil) > min(Yil))
+                        (log_yield[which.max(Yil)] - log_yield[which.min(Yil)]) / (max(Yil) - min(Yil))
+                      else 0,
+      .groups = "drop"
+    )
+  train <- train %>% left_join(recent_slope_by_country, by = "Country_ISO") %>%
+    mutate(recent_slope = ifelse(is.na(recent_slope), 0, recent_slope))
+  test <- test %>% left_join(recent_slope_by_country, by = "Country_ISO") %>%
+    mutate(recent_slope = ifelse(is.na(recent_slope), 0, recent_slope))
+
+  # Local-linear-regression benchmark (GPT round 6, item 3): the
+  # "formal" version of drift - fits log_yield ~ Yil by OLS within the
+  # window (same as detrend's own fit) and extrapolates to T+h. Only
+  # meaningful on the RAW representation (on demean/detrend it would
+  # trivially predict ~0 since the trend was already removed), so it
+  # is left NA for those two.
+  lintrend_pred_by_country <- NULL
+  if (transform_type == "raw") {
+    lintrend_stats <- win_data %>% group_by(Country_ISO) %>%
+      summarise(
+        n_obs = n(),
+        a = if (n() >= 3) tryCatch(coef(lm(log_yield ~ Yil))[1], error = function(e) NA_real_) else NA_real_,
+        b = if (n() >= 3) tryCatch(coef(lm(log_yield ~ Yil))[2], error = function(e) NA_real_) else NA_real_,
+        .groups = "drop"
+      )
+    lintrend_pred_by_country <- lintrend_stats %>%
+      mutate(lintrend_pred = a + b * (T_origin + h)) %>%
+      select(Country_ISO, lintrend_pred)
+  }
+
+  if (transform_type == "demean") {
+    # LEAKAGE-FREE within-country demeaning (Analysis C3). Removes only
+    # the country's own window-mean LEVEL. GPT round 5 correctly points
+    # out this does NOT remove a linear trend if one exists - see
+    # "detrend" below for that.
+    win_stats <- win_data %>% group_by(Country_ISO) %>%
+      summarise(cm = mean(log_yield), .groups = "drop") %>% mutate(b = 0)
+  } else if (transform_type == "detrend") {
+    # LEAKAGE-FREE within-country linear DETRENDING. Fits
+    # log_yield ~ Yil separately per country using ONLY the window,
+    # then removes the fitted level+trend line log_yield - (a + b*Yil).
+    # Falls back to demeaning (b=0) for a country with < 3 distinct
+    # years in the window (too few points for a stable slope).
+    win_stats <- win_data %>% group_by(Country_ISO) %>%
+      summarise(
+        n_obs = n(),
+        a = if (n() >= 3) tryCatch(coef(lm(log_yield ~ Yil))[1], error = function(e) NA_real_) else mean(log_yield),
+        b = if (n() >= 3) tryCatch(coef(lm(log_yield ~ Yil))[2], error = function(e) NA_real_) else 0,
+        .groups = "drop"
+      ) %>%
+      mutate(cm = a) %>%   # so the same "cm + b*year" formula below works for both cases
+      filter(!is.na(cm), !is.na(b))
+  }
+
+  if (transform_type %in% c("demean", "detrend")) {
+    train <- train %>% left_join(win_stats, by = "Country_ISO") %>%
+      filter(!is.na(cm)) %>%
+      mutate(log_yield = log_yield - (cm + b * Yil),
+             target     = target     - (cm + b * (Yil + h)))
+    test <- test %>% left_join(win_stats, by = "Country_ISO") %>%
+      filter(!is.na(cm)) %>%
+      mutate(log_yield = log_yield - (cm + b * T_origin),
+             target     = target     - (cm + b * (T_origin + h)))
+    if (nrow(train) < 20 || nrow(test) == 0) return(NULL)
+    # Also transform win_data itself (same formula) so the drift/AR(1)
+    # benchmarks computed below see the SAME representation as train/test.
+    win_data <- win_data %>% left_join(win_stats, by = "Country_ISO") %>%
+      filter(!is.na(cm)) %>%
+      mutate(log_yield = log_yield - (cm + b * Yil)) %>%
+      select(-cm, -b, -any_of("a"), -any_of("n_obs"))
   }
 
   train_countries <- sort(unique(train$Country_ISO))
@@ -227,10 +311,6 @@ fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
   }
 
   # --- Extra Trees, ONLY as a robustness check on the main analysis ---
-  # (not run for ablation, balanced-weights, or common-origin, to avoid
-  # turning this into a model-comparison study; uses the ORIGINAL
-  # numeric features, not the FE dummy matrix, since tree splits on
-  # ~100 near-collinear country dummies would be slow and uninformative)
   if (also_fit_extratrees) {
     rf_train_data <- as.data.frame(cbind(train[, feature_cols, drop = FALSE], target = y_train))
     rf_fit  <- ranger(target ~ ., data = rf_train_data, num.trees = RF_TREES, splitrule = "extratrees")
@@ -239,24 +319,76 @@ fit_one_cell_one_seed <- function(df, L, h, T_origin, seed,
     rf_pred <- rep(NA_real_, nrow(test))
   }
 
-  # Historical-mean benchmark (per country, from the training window)
+  # Historical-mean ("local mean") benchmark (per country, from the
+  # training window, on whichever representation is active)
   hist_mean_by_country <- train %>% group_by(Country_ISO) %>%
     summarise(hist_mean = mean(target), .groups = "drop")
   test_hm <- test %>% left_join(hist_mean_by_country, by = "Country_ISO")
 
+  # --- Drift benchmark (random walk with drift): y_hat_{T+h} = y_T + h * slope,
+  # slope = average per-year change within the window (GPT round 5,
+  # priority item 3). Computed from win_data (already in the active
+  # representation) so it is directly comparable to persistence/model. ---
+  drift_by_country <- win_data %>% group_by(Country_ISO) %>%
+    summarise(
+      slope    = if (n() >= 2 && (max(Yil) > min(Yil)))
+                   (log_yield[which.max(Yil)] - log_yield[which.min(Yil)]) / (max(Yil) - min(Yil))
+                 else NA_real_,
+      last_val = log_yield[which.max(Yil)],
+      .groups = "drop"
+    )
+  test_drift <- test %>% left_join(drift_by_country, by = "Country_ISO") %>%
+    mutate(drift_pred = ifelse(is.na(slope), NA_real_, last_val + slope * h))
+
+  # --- AR(1) benchmark: fit y_t = c + phi*y_{t-1} PER COUNTRY on
+  # consecutive-year pairs within the window, then forecast h steps
+  # ahead with the closed-form AR(1) formula. Falls back to NA (and
+  # thus gets excluded from that country's AR1 RMSE) if too few
+  # consecutive-year pairs exist or the fit is degenerate. ---
+  ar1_by_country <- win_data %>%
+    group_by(Country_ISO) %>%
+    group_modify(function(g, key) {
+      g <- g %>% arrange(Yil)
+      is_consec <- c(FALSE, diff(g$Yil) == 1)
+      y_t   <- g$log_yield[is_consec]
+      y_tm1 <- g$log_yield[which(is_consec) - 1]
+      if (length(y_t) < 3) return(data.frame(c = NA_real_, phi = NA_real_, last_val = g$log_yield[nrow(g)]))
+      fit <- tryCatch(lm(y_t ~ y_tm1), error = function(e) NULL)
+      if (is.null(fit)) return(data.frame(c = NA_real_, phi = NA_real_, last_val = g$log_yield[nrow(g)]))
+      cf <- coef(fit)
+      data.frame(c = cf[1], phi = cf[2], last_val = g$log_yield[nrow(g)])
+    }) %>% ungroup()
+
+  test_ar1 <- test %>% left_join(ar1_by_country, by = "Country_ISO") %>%
+    mutate(
+      ar1_pred = ifelse(
+        is.na(phi) | abs(phi) >= 1,
+        NA_real_,
+        c * (1 - phi^h) / (1 - phi) + phi^h * last_val   # standard h-step AR(1) forecast with drift c
+      )
+    )
+
+  if (!is.null(lintrend_pred_by_country)) {
+    test_lintrend <- test %>% left_join(lintrend_pred_by_country, by = "Country_ISO")
+    sq_err_lintrend <- (test_lintrend$lintrend_pred - y_test)^2
+  } else {
+    sq_err_lintrend <- rep(NA_real_, nrow(test))
+  }
+
   # Return COUNTRY-LEVEL squared errors, long format: one row per
-  # (country, origin, seed) with errors for all three approaches.
-  # Downstream aggregation decides whether to average across countries
-  # (equal-country weight) or pool across all rows (pooled weight).
+  # (country, origin, seed) with errors for all approaches.
   data.frame(
     Country_ISO = test$Country_ISO,
     L = L, h = h, T_origin = T_origin, seed = seed,
     feature_set = feature_set_name, country_fe = use_country_fe,
-    balanced_weights = country_balanced_weights,
+    balanced_weights = country_balanced_weights, transform_type = transform_type,
     sq_err_model    = (en_pred - y_test)^2,
-    sq_err_rf       = (rf_pred - y_test)^2,   # NA when also_fit_extratrees = FALSE
+    sq_err_rf       = (rf_pred - y_test)^2,           # NA when also_fit_extratrees = FALSE
     sq_err_persist  = (test$log_yield - y_test)^2,
-    sq_err_histmean = (test_hm$hist_mean - y_test)^2
+    sq_err_histmean = (test_hm$hist_mean - y_test)^2,
+    sq_err_drift    = (test_drift$drift_pred - y_test)^2,   # NA where slope undefined
+    sq_err_ar1      = (test_ar1$ar1_pred - y_test)^2,       # NA where AR(1) undefined
+    sq_err_lintrend = sq_err_lintrend                       # NA except transform_type == "raw"
   )
 }
 
@@ -314,13 +446,19 @@ aggregate_two_ways <- function(country_level_errors) {
     summarise(
       rmse_model_pooled    = sqrt(mean(sq_err_model)),
       rmse_persist_pooled  = sqrt(mean(sq_err_persist)),
-      rmse_histmean_pooled = sqrt(mean(sq_err_histmean)),
+      rmse_histmean_pooled = sqrt(mean(sq_err_histmean, na.rm = TRUE)),
+      rmse_drift_pooled    = sqrt(mean(sq_err_drift, na.rm = TRUE)),
+      rmse_ar1_pooled      = sqrt(mean(sq_err_ar1, na.rm = TRUE)),
+      rmse_lintrend_pooled = sqrt(mean(sq_err_lintrend, na.rm = TRUE)),
       rmse_rf_pooled       = if (has_rf) sqrt(mean(sq_err_rf, na.rm = TRUE)) else NA_real_,
       .groups = "drop"
     ) %>%
     mutate(
       skill_pooled_persist  = 1 - rmse_model_pooled / rmse_persist_pooled,
       skill_pooled_histmean = 1 - rmse_model_pooled / rmse_histmean_pooled,
+      skill_pooled_drift    = 1 - rmse_model_pooled / rmse_drift_pooled,
+      skill_pooled_ar1      = 1 - rmse_model_pooled / rmse_ar1_pooled,
+      skill_pooled_lintrend = 1 - rmse_model_pooled / rmse_lintrend_pooled,
       skill_rf_pooled_persist = if (has_rf) 1 - rmse_rf_pooled / rmse_persist_pooled else NA_real_
     )
 
@@ -329,7 +467,10 @@ aggregate_two_ways <- function(country_level_errors) {
     summarise(
       rmse_i_model    = sqrt(mean(sq_err_model)),
       rmse_i_persist  = sqrt(mean(sq_err_persist)),
-      rmse_i_histmean = sqrt(mean(sq_err_histmean)),
+      rmse_i_histmean = sqrt(mean(sq_err_histmean, na.rm = TRUE)),
+      rmse_i_drift    = sqrt(mean(sq_err_drift, na.rm = TRUE)),
+      rmse_i_ar1      = sqrt(mean(sq_err_ar1, na.rm = TRUE)),
+      rmse_i_lintrend = sqrt(mean(sq_err_lintrend, na.rm = TRUE)),
       rmse_i_rf       = if (has_rf) sqrt(mean(sq_err_rf, na.rm = TRUE)) else NA_real_,
       .groups = "drop"
     )
@@ -339,13 +480,19 @@ aggregate_two_ways <- function(country_level_errors) {
     summarise(
       rmse_model_balanced    = mean(rmse_i_model),
       rmse_persist_balanced  = mean(rmse_i_persist),
-      rmse_histmean_balanced = mean(rmse_i_histmean),
+      rmse_histmean_balanced = mean(rmse_i_histmean, na.rm = TRUE),
+      rmse_drift_balanced    = mean(rmse_i_drift, na.rm = TRUE),
+      rmse_ar1_balanced      = mean(rmse_i_ar1, na.rm = TRUE),
+      rmse_lintrend_balanced = mean(rmse_i_lintrend, na.rm = TRUE),
       rmse_rf_balanced       = if (has_rf) mean(rmse_i_rf, na.rm = TRUE) else NA_real_,
       .groups = "drop"
     ) %>%
     mutate(
       skill_balanced_persist  = 1 - rmse_model_balanced / rmse_persist_balanced,
       skill_balanced_histmean = 1 - rmse_model_balanced / rmse_histmean_balanced,
+      skill_balanced_drift    = 1 - rmse_model_balanced / rmse_drift_balanced,
+      skill_balanced_ar1      = 1 - rmse_model_balanced / rmse_ar1_balanced,
+      skill_balanced_lintrend = 1 - rmse_model_balanced / rmse_lintrend_balanced,
       skill_rf_balanced_persist = if (has_rf) 1 - rmse_rf_balanced / rmse_persist_balanced else NA_real_
     )
 
@@ -364,14 +511,17 @@ aggregate_two_ways <- function(country_level_errors) {
 run_common_origin_analysis <- function(df, h, crop_name, feature_set_name = "full",
                                         L_set = L_VALUES_PRIMARY, tag = "primary",
                                         min_train_sample = MIN_TRAIN_SAMPLE,
-                                        demean_within_window = FALSE) {
+                                        transform_type = "raw",
+                                        paired_countries = FALSE) {
 
   # feature_set_name is appended to the checkpoint filename ONLY when
   # it's not "full", so every already-computed "full"-feature-set run
   # (B1/B2/B2b/B3) keeps matching its existing cache file and is never
   # silently overwritten or wrongly reused by a different feature set.
   feat_suffix <- if (feature_set_name == "full") "" else paste0("_", feature_set_name)
-  ckpt_file <- file.path(OUTPUT_DIR, paste0("ckpt_common_origin_", crop_name, "_h", h, "_", tag, feat_suffix, ".rds"))
+  trans_suffix <- if (transform_type == "raw") "" else paste0("_", transform_type)
+  paired_suffix <- if (paired_countries) "_paired" else ""
+  ckpt_file <- file.path(OUTPUT_DIR, paste0("ckpt_common_origin_", crop_name, "_h", h, "_", tag, feat_suffix, trans_suffix, paired_suffix, ".rds"))
   if (file.exists(ckpt_file)) {
     cat("Skipping common-origin h =", h, "(", tag, ", already done)\n")
     return(readRDS(ckpt_file))
@@ -390,7 +540,8 @@ run_common_origin_analysis <- function(df, h, crop_name, feature_set_name = "ful
       for (seed in 1:N_SEEDS) {
         res <- fit_one_cell_one_seed(df, L, h, T_origin, seed, feature_set_name,
                                       min_train_sample = min_train_sample,
-                                      demean_within_window = demean_within_window)
+                                      transform_type = transform_type,
+                                      paired_countries = paired_countries)
         if (!is.null(res)) all_rows[[length(all_rows) + 1]] <- res
       }
     }
@@ -665,12 +816,112 @@ run_within_country_clean <- function(crop_name) {
                                        feature_set_name = "full",
                                        L_set = L_VALUES_PRIMARY,
                                        tag = "within_country_clean",
-                                       demean_within_window = TRUE)
+                                       transform_type = "demean")
     if (!is.null(res)) res_all[[as.character(h)]] <- res$aggregated
   }
   if (length(res_all) > 0) saveRDS(bind_rows(res_all), out_tmp)
 }
 for (crop in CROPS) run_within_country_clean(crop)
+
+##############################################
+# EXTRA ANALYSES, ROUND 2 (GPT round 5 critique): raw vs demean vs
+# detrend decomposition, plus drift/AR(1) benchmarks. Also its own
+# checkpointed block, independent of DONE_<crop>.txt.
+##############################################
+# NOTE ON RECOMPUTATION: fixing the checkpoint-collision risk above
+# (adding transform_type to the checkpoint filename) means the earlier
+# "demean" (within_country_clean) results no longer match their old
+# checkpoint filename and WILL be recomputed here as part of this
+# block - this is a one-time, unavoidable cost of the fix, not
+# wasted effort repeated on every future run.
+
+TRANSFORM_TYPES <- c("raw", "demean", "detrend")
+
+run_decomposition_analysis <- function(crop_name) {
+  out_tmp <- file.path(OUTPUT_DIR, paste0("_tmp_decomposition_", crop_name, ".rds"))
+  if (file.exists(out_tmp)) {
+    cat("Skipping decomposition (already done):", crop_name, "\n")
+    return(invisible(NULL))
+  }
+  cat("\n===== decomposition (raw/demean/detrend):", crop_name, "=====\n")
+  df <- prepare_crop_data(crop_name)
+  res_all <- list()
+  for (tt in TRANSFORM_TYPES) {
+    for (h in H_VALUES) {
+      res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full",
+                                         L_set = L_VALUES_PRIMARY, tag = "primary_decomp",
+                                         transform_type = tt)
+      if (!is.null(res)) {
+        r <- res$aggregated
+        r$transform_type <- tt
+        res_all[[paste(tt, h)]] <- r
+      }
+    }
+  }
+  if (length(res_all) > 0) saveRDS(bind_rows(res_all), out_tmp)
+}
+for (crop in CROPS) run_decomposition_analysis(crop)
+
+##############################################
+# EXTRA ANALYSES, ROUND 3 (GPT round 6 critique): the two "go/no-go"
+# tests before submission. Own checkpoints, independent of
+# DONE_<crop>.txt - just run the file as-is.
+##############################################
+
+# --- Go/no-go test #1: does drift's advantage over Elastic Net
+#     survive once Elastic Net is explicitly given the same
+#     within-window trend slope as a feature? Run only on "raw"
+#     (where drift's advantage was largest) since that is the
+#     decisive case GPT asked for. ---
+run_trend_feature_check <- function(crop_name) {
+  out_tmp <- file.path(OUTPUT_DIR, paste0("_tmp_trend_feature_", crop_name, ".rds"))
+  if (file.exists(out_tmp)) {
+    cat("Skipping trend_feature_check (already done):", crop_name, "\n")
+    return(invisible(NULL))
+  }
+  cat("\n===== trend_feature_check:", crop_name, "=====\n")
+  df <- prepare_crop_data(crop_name)
+  res_all <- list()
+  for (h in H_VALUES) {
+    res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full_plus_trend",
+                                       L_set = L_VALUES_PRIMARY, tag = "primary_decomp",
+                                       transform_type = "raw")
+    if (!is.null(res)) res_all[[as.character(h)]] <- res$aggregated
+  }
+  if (length(res_all) > 0) saveRDS(bind_rows(res_all), out_tmp)
+}
+for (crop in CROPS) run_trend_feature_check(crop)
+
+# --- Go/no-go test #2: redo the raw/demean/detrend decomposition
+#     restricted to the country set that survives ALL THREE
+#     representations (paired composition), so the reversal cannot be
+#     an artifact of which countries happen to drop out under detrend. ---
+run_paired_decomposition <- function(crop_name) {
+  out_tmp <- file.path(OUTPUT_DIR, paste0("_tmp_paired_decomp_", crop_name, ".rds"))
+  if (file.exists(out_tmp)) {
+    cat("Skipping paired_decomposition (already done):", crop_name, "\n")
+    return(invisible(NULL))
+  }
+  cat("\n===== paired_decomposition:", crop_name, "=====\n")
+  df <- prepare_crop_data(crop_name)
+  res_all <- list()
+  for (tt in TRANSFORM_TYPES) {
+    for (h in H_VALUES) {
+      res <- run_common_origin_analysis(df, h, crop_name, feature_set_name = "full",
+                                         L_set = L_VALUES_PRIMARY, tag = "primary_decomp",
+                                         transform_type = tt, paired_countries = TRUE)
+      if (!is.null(res)) {
+        r <- res$aggregated
+        r$transform_type <- tt
+        res_all[[paste(tt, h)]] <- r
+      }
+    }
+  }
+  if (length(res_all) > 0) saveRDS(bind_rows(res_all), out_tmp)
+}
+for (crop in CROPS) run_paired_decomposition(crop)
+
+
 
 # Combine main summaries across all crops (stacked rows, single sheet -
 # this is the format that turned out to be most convenient to work with)
@@ -705,6 +956,9 @@ build_multisheet_workbook("_tmp_common_country_", "common_country_ALL_CROPS.xlsx
 build_multisheet_workbook("_tmp_ablation_common_origin_", "ablation_common_origin_ALL_CROPS.xlsx")
 build_multisheet_workbook("_tmp_within_country_", "within_country_ALL_CROPS.xlsx")
 build_multisheet_workbook("_tmp_within_country_clean_", "within_country_clean_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_decomposition_", "decomposition_raw_demean_detrend_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_trend_feature_", "trend_feature_check_ALL_CROPS.xlsx")
+build_multisheet_workbook("_tmp_paired_decomp_", "paired_decomposition_ALL_CROPS.xlsx")
 
 # NOTE: the _tmp_*.rds files are NO LONGER deleted here. They act as a
 # durable per-crop, per-analysis cache: if you add a new analysis later
