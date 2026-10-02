@@ -1014,3 +1014,42 @@ cat("\n\nFigures saved (PDF + 1600 dpi PNG) in:", FIGURES_DIR, "\n")
 #                                                (controls for country-composition
 #                                                confound alongside the origin confound)
 ##############################################
+
+##############################################
+# FIGURE 2 — raw / demean / detrend, 3-panel L x h heatmap
+##############################################
+# Reads decomposition_raw_demean_detrend_ALL_CROPS.xlsx (already
+# computed above - no new model fitting), pools skill across the 8
+# crops, and saves Figure 2 as PDF + 1600 dpi PNG. Cheap, re-runs
+# instantly every time the script is run, no checkpoint needed.
+
+decomp_path <- file.path(OUTPUT_DIR, "decomposition_raw_demean_detrend_ALL_CROPS.xlsx")
+decomp_sheets <- readxl::excel_sheets(decomp_path)
+decomp_all <- bind_rows(lapply(decomp_sheets, function(sh) {
+  readxl::read_excel(decomp_path, sheet = sh) %>% mutate(crop = sh)
+}))
+
+fig2_data <- decomp_all %>%
+  group_by(transform_type, L, h) %>%
+  summarise(skill_balanced_persist = mean(skill_balanced_persist, na.rm = TRUE), .groups = "drop") %>%
+  mutate(transform_type = factor(transform_type,
+                                  levels = c("raw", "demean", "detrend"),
+                                  labels = c("Raw", "Demeaned", "Detrended")))
+
+fig2 <- ggplot(fig2_data, aes(x = factor(h), y = factor(L), fill = skill_balanced_persist)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.0f%%", skill_balanced_persist * 100)), size = 3) +
+  scale_fill_gradient2(
+    low = "#B5302B", mid = "#F5F0E6", high = "#185FA5", midpoint = 0,
+    name = "Skill relative\nto persistence",
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  facet_wrap(~ transform_type, nrow = 1) +
+  labs(x = "Forecast horizon (h, years)", y = "Training-window length (L, years)") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank(), strip.text = element_text(face = "bold"))
+
+ggsave(file.path(FIGURES_DIR, "Fig2_raw_demean_detrend_heatmap.pdf"), fig2, width = 11, height = 4.5, units = "in")
+ggsave(file.path(FIGURES_DIR, "Fig2_raw_demean_detrend_heatmap.png"), fig2, width = 11, height = 4.5, units = "in", dpi = 1600)
+
+cat("\n\nFigure 2 saved in:", FIGURES_DIR, "\n")
