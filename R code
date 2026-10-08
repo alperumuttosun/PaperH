@@ -1053,3 +1053,260 @@ ggsave(file.path(FIGURES_DIR, "Fig2_raw_demean_detrend_heatmap.pdf"), fig2, widt
 ggsave(file.path(FIGURES_DIR, "Fig2_raw_demean_detrend_heatmap.png"), fig2, width = 11, height = 4.5, units = "in", dpi = 1600)
 
 cat("\n\nFigure 2 saved in:", FIGURES_DIR, "\n")
+
+##############################################
+# FIGURE 1 — skill vs training-window length L, one line per horizon h
+##############################################
+# Reads common_origin_ALL_CROPS.xlsx (the primary common-origin grid,
+# already computed above - no new model fitting), pools skill across
+# the 8 crops, and saves Figure 1 as PDF + 1600 dpi PNG.
+
+co_path   <- file.path(OUTPUT_DIR, "common_origin_ALL_CROPS.xlsx")
+co_sheets <- readxl::excel_sheets(co_path)
+co_all <- bind_rows(lapply(co_sheets, function(sh) {
+  readxl::read_excel(co_path, sheet = sh) %>% mutate(crop = sh)
+}))
+
+fig1_data <- co_all %>%
+  filter(L %in% c(20, 30, 40)) %>%               # primary grid only (L=10 and L=50 are sensitivity checks)
+  group_by(L, h) %>%
+  summarise(skill = mean(skill_balanced_persist, na.rm = TRUE), .groups = "drop") %>%
+  mutate(h = factor(h, levels = c(1, 3, 5, 10), labels = paste0("h = ", c(1, 3, 5, 10))))
+
+fig1 <- ggplot(fig1_data, aes(x = L, y = skill, color = h, group = h)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_x_continuous(breaks = c(20, 30, 40)) +
+  scale_color_manual(values = c("#B5302B", "#E08A3C", "#5B8DB8", "#185FA5"),
+                     name = "Forecast horizon") +
+  labs(x = "Training-window length (L, years)", y = "Skill relative to persistence") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+
+ggsave(file.path(FIGURES_DIR, "Fig1_skill_vs_L_by_horizon.pdf"), fig1, width = 6.5, height = 4.2, units = "in")
+ggsave(file.path(FIGURES_DIR, "Fig1_skill_vs_L_by_horizon.png"), fig1, width = 6.5, height = 4.2, units = "in", dpi = 1600)
+
+cat("\nFigure 1 saved in:", FIGURES_DIR, "\n")
+
+##############################################
+# STEP_H08 — COUNTRY-BLOCK BOOTSTRAP CONFIDENCE INTERVALS (v13)
+##############################################
+# WHY: the paper's headline differences are small (e.g. skill 0.017 at
+# L=20 vs 0.027 at L=40), so each main comparison needs an uncertainty
+# statement. We resample COUNTRIES (not country-years) with replacement,
+# separately within each crop, because errors of one country are
+# correlated over origins, seeds and windows. The pooled number is the
+# equal-weight mean over the 8 crops, like everywhere else in the paper.
+#
+# COST: the earlier checkpoints stored only summaries, not country-level
+# errors, so the Elastic Net must be refitted ONCE here (L = 20/30/40,
+# 4 horizons, 4 configurations). Each piece is checkpointed
+# (ckpt_boot_*.rds), so an interrupted run resumes where it stopped and
+# a finished run only redoes the cheap bootstrap arithmetic.
+# Existing DONE_*.txt markers and _tmp_*.rds files are NOT touched.
+
+BOOT_B <- 2000                      # number of bootstrap draws
+BOOT_L <- c(20, 30, 40)             # primary windows
+BOOT_CONFIGS <- list(               # comment out a line to skip a configuration
+  raw_all        = list(transform = "raw",     paired = FALSE),  # main-text numbers
+  raw_paired     = list(transform = "raw",     paired = TRUE),   # same countries as below
+  demean_paired  = list(transform = "demean",  paired = TRUE),
+  detrend_paired = list(transform = "detrend", paired = TRUE)
+)
+
+# Fit once, keep only compact country-level sums per (country, L, h).
+boot_collect_country_errors <- function(df, crop_name, h, cfg_name, cfg) {
+  ckpt <- file.path(OUTPUT_DIR, paste0("ckpt_boot_", crop_name, "_h", h, "_", cfg_name, ".rds"))
+  if (file.exists(ckpt)) return(readRDS(ckpt))                    # resume: already fitted
+  origins <- get_common_origins(df, h, L_set = BOOT_L)            # same origin rule as the main design
+  if (length(origins) < 3) { saveRDS(NULL, ckpt); return(NULL) }  # too few origins: remember and skip
+  rows <- list()
+  for (L in BOOT_L) for (T_origin in origins) for (seed in 1:N_SEEDS) {
+    res <- fit_one_cell_one_seed(df, L, h, T_origin, seed, "full",
+                                 min_train_sample = MIN_TRAIN_SAMPLE,
+                                 transform_type = cfg$transform,
+                                 paired_countries = cfg$paired)
+    if (!is.null(res)) rows[[length(rows) + 1]] <- res[, c("Country_ISO", "L", "h", "sq_err_model", "sq_err_persist")]
+  }
+  if (length(rows) == 0) { saveRDS(NULL, ckpt); return(NULL) }
+  out <- bind_rows(rows) %>%
+    group_by(Country_ISO, L, h) %>%                               # sums + count => exact country RMSE later
+    summarise(sum_model = sum(sq_err_model), sum_persist = sum(sq_err_persist),
+              n = n(), .groups = "drop")
+  saveRDS(out, ckpt)
+  out
+}
+
+boot_cell_name <- function(L, h) paste0("L", L, "_h", h)          # e.g. "L40_h10"
+
+# Country x cell matrices of country-level RMSE (model and persistence).
+boot_matrices <- function(tab, countries) {
+  tab <- tab %>% mutate(cell = boot_cell_name(L, h),
+                        rm = sqrt(sum_model / n), rp = sqrt(sum_persist / n))
+  cells <- as.vector(outer(BOOT_L, H_VALUES, boot_cell_name))
+  Rm <- matrix(NA_real_, length(countries), length(cells), dimnames = list(countries, cells))
+  Rp <- Rm
+  ri <- match(tab$Country_ISO, countries); ci <- match(tab$cell, cells)
+  Rm[cbind(ri, ci)] <- tab$rm
+  Rp[cbind(ri, ci)] <- tab$rp
+  list(Rm = Rm, Rp = Rp)
+}
+
+# Equal-country-weight skill for a set of resampled country indices.
+boot_skill <- function(M, idx) {
+  1 - colMeans(M$Rm[idx, , drop = FALSE], na.rm = TRUE) /
+      colMeans(M$Rp[idx, , drop = FALSE], na.rm = TRUE)
+}
+
+# List of contrasts. Each: label, group, config a, cells a, (optional) config b, cells b.
+# Value = mean skill over cells a  (minus mean skill over cells b, if given).
+boot_contrast_specs <- function() {
+  sp <- list()
+  add <- function(label, group, a_cfg, a_cells, b_cfg = NULL, b_cells = NULL)
+    sp[[length(sp) + 1]] <<- list(label = label, group = group, a_cfg = a_cfg, a_cells = a_cells,
+                                   b_cfg = b_cfg, b_cells = b_cells)
+  cn <- boot_cell_name
+  for (L in BOOT_L) for (h in H_VALUES)                                  # skill levels, main design
+    add(paste0("skill raw (all countries) L=", L, " h=", h), "level_raw", "raw_all", cn(L, h))
+  for (h in H_VALUES)                                                    # window-length effect per horizon
+    add(paste0("L40 - L20 | h=", h), "L_effect", "raw_all", cn(40, h), "raw_all", cn(20, h))
+  add("L40 - L20 | mean over h", "L_effect", "raw_all", cn(40, H_VALUES), "raw_all", cn(20, H_VALUES))
+  add("L30 - L20 | mean over h", "L_effect", "raw_all", cn(30, H_VALUES), "raw_all", cn(20, H_VALUES))
+  add("L40 - L30 | mean over h", "L_effect", "raw_all", cn(40, H_VALUES), "raw_all", cn(30, H_VALUES))
+  for (L in BOOT_L)                                                      # horizon effect per window
+    add(paste0("h10 - h1 | L=", L), "h_effect", "raw_all", cn(L, 10), "raw_all", cn(L, 1))
+  add("h10 - h1 | mean over L", "h_effect", "raw_all", cn(BOOT_L, 10), "raw_all", cn(BOOT_L, 1))
+  # horizon effect at (almost) equal number of training pairs n = L - h:
+  add("EQUAL n_train: (L=30,h=10; n=20) - (L=20,h=1; n=19)", "equal_ntrain",
+      "raw_all", cn(30, 10), "raw_all", cn(20, 1))
+  add("EQUAL n_train: (L=40,h=10; n=30) - (L=30,h=1; n=29)", "equal_ntrain",
+      "raw_all", cn(40, 10), "raw_all", cn(30, 1))
+  for (L in BOOT_L) for (h in H_VALUES) {                                # representation effect, same countries
+    add(paste0("raw - detrend (paired) L=", L, " h=", h), "raw_minus_detrend",
+        "raw_paired", cn(L, h), "detrend_paired", cn(L, h))
+    add(paste0("raw - demean (paired) L=", L, " h=", h), "raw_minus_demean",
+        "raw_paired", cn(L, h), "demean_paired", cn(L, h))
+    add(paste0("skill detrend (paired) L=", L, " h=", h), "level_detrend",
+        "detrend_paired", cn(L, h))
+    add(paste0("skill demean (paired) L=", L, " h=", h), "level_demean",
+        "demean_paired", cn(L, h))
+  }
+  add("raw - detrend (paired) | mean over L,h", "raw_minus_detrend", "raw_paired",
+      as.vector(outer(BOOT_L, H_VALUES, cn)), "detrend_paired", as.vector(outer(BOOT_L, H_VALUES, cn)))
+  add("raw - demean (paired) | mean over L,h", "raw_minus_demean", "raw_paired",
+      as.vector(outer(BOOT_L, H_VALUES, cn)), "demean_paired", as.vector(outer(BOOT_L, H_VALUES, cn)))
+  sp
+}
+
+# Value of one contrast given a list of per-config skill vectors (named by cell).
+boot_eval_spec <- function(sp, S) {
+  m <- function(v) { v <- v[is.finite(v)]; if (length(v) == 0) NA_real_ else mean(v) }
+  a <- m(S[[sp$a_cfg]][sp$a_cells])
+  if (is.null(sp$b_cfg)) return(a)
+  # a and b must be available for the same cells, otherwise the contrast is undefined
+  va <- S[[sp$a_cfg]][sp$a_cells]; vb <- S[[sp$b_cfg]][sp$b_cells]
+  ok <- is.finite(va) & is.finite(vb)
+  if (!any(ok)) return(NA_real_)
+  mean(va[ok]) - mean(vb[ok])
+}
+
+# One crop: point estimates (full sample) + B bootstrap draws of every contrast.
+boot_one_crop <- function(tabs, specs, crop_index) {
+  paired_cfgs <- intersect(names(tabs), c("raw_paired", "demean_paired", "detrend_paired"))
+  uni_all    <- if ("raw_all" %in% names(tabs)) sort(unique(tabs$raw_all$Country_ISO)) else character(0)
+  uni_paired <- sort(unique(unlist(lapply(tabs[paired_cfgs], function(t) t$Country_ISO))))
+  Ms <- list()
+  if (length(uni_all) > 0) Ms$raw_all <- boot_matrices(tabs$raw_all, uni_all)
+  for (cf in paired_cfgs) Ms[[cf]] <- boot_matrices(tabs[[cf]], uni_paired)
+
+  set.seed(20261008 + crop_index)                                  # reproducible; fixed per crop
+  idx_all    <- if (length(uni_all) > 0)
+                  matrix(sample.int(length(uni_all), BOOT_B * length(uni_all), TRUE), nrow = BOOT_B) else NULL
+  idx_paired <- if (length(uni_paired) > 0)
+                  matrix(sample.int(length(uni_paired), BOOT_B * length(uni_paired), TRUE), nrow = BOOT_B) else NULL
+  # the SAME resampled countries are used for all paired configurations,
+  # so raw-minus-detrend differences are genuinely paired.
+
+  skills_for <- function(idx_all_row, idx_paired_row) {
+    S <- list()
+    if (!is.null(Ms$raw_all))  S$raw_all <- boot_skill(Ms$raw_all, idx_all_row)
+    for (cf in paired_cfgs)    S[[cf]]   <- boot_skill(Ms[[cf]], idx_paired_row)
+    S
+  }
+
+  usable <- vapply(specs, function(sp) {
+    all(c(sp$a_cfg, sp$b_cfg) %in% names(Ms))
+  }, logical(1))
+  specs <- specs[usable]
+
+  S0 <- skills_for(if (!is.null(Ms$raw_all)) seq_along(uni_all) else NULL,
+                   if (length(uni_paired) > 0) seq_along(uni_paired) else NULL)
+  point <- vapply(specs, boot_eval_spec, numeric(1), S = S0)
+  draws <- matrix(NA_real_, BOOT_B, length(specs))
+  for (b in seq_len(BOOT_B)) {
+    Sb <- skills_for(if (!is.null(idx_all)) idx_all[b, ] else NULL,
+                     if (!is.null(idx_paired)) idx_paired[b, ] else NULL)
+    draws[b, ] <- vapply(specs, boot_eval_spec, numeric(1), S = Sb)
+  }
+  list(labels = vapply(specs, `[[`, "", "label"), groups = vapply(specs, `[[`, "", "group"),
+       point = point, draws = draws)
+}
+
+# Summaries: percentile 95% CI, and the share of draws above zero.
+boot_summarise <- function(labels, groups, point, draws) {
+  data.frame(
+    group = groups, contrast = labels, estimate = point,
+    ci_lo = apply(draws, 2, quantile, probs = 0.025, na.rm = TRUE),
+    ci_hi = apply(draws, 2, quantile, probs = 0.975, na.rm = TRUE),
+    share_draws_gt0 = apply(draws, 2, function(x) mean(x > 0, na.rm = TRUE)),
+    stringsAsFactors = FALSE, row.names = NULL
+  )
+}
+
+run_bootstrap_all <- function() {
+  specs <- boot_contrast_specs()
+  per_crop <- list()
+  for (ci in seq_along(CROPS)) {
+    cn_ <- CROPS[ci]
+    cat("\n===== bootstrap:", cn_, "=====\n")
+    df <- prepare_crop_data(cn_)
+    tabs <- list()
+    for (cfg_name in names(BOOT_CONFIGS)) {
+      parts <- lapply(H_VALUES, function(h)
+        boot_collect_country_errors(df, cn_, h, cfg_name, BOOT_CONFIGS[[cfg_name]]))
+      parts <- parts[!vapply(parts, is.null, logical(1))]
+      if (length(parts) > 0) tabs[[cfg_name]] <- bind_rows(parts)
+    }
+    per_crop[[cn_]] <- boot_one_crop(tabs, specs, ci)
+  }
+  # by-crop table
+  by_crop <- bind_rows(lapply(names(per_crop), function(cn_) {
+    r <- per_crop[[cn_]]
+    cbind(crop = cn_, boot_summarise(r$labels, r$groups, r$point, r$draws), stringsAsFactors = FALSE)
+  }))
+  # pooled over crops: equal crop weights, draw by draw (same draw number across crops)
+  all_labels <- unique(unlist(lapply(per_crop, `[[`, "labels")))
+  pooled_point <- numeric(length(all_labels)); pooled_draws <- matrix(NA_real_, BOOT_B, length(all_labels))
+  groups <- character(length(all_labels))
+  for (k in seq_along(all_labels)) {
+    pts <- c(); drs <- list()
+    for (cn_ in names(per_crop)) {
+      r <- per_crop[[cn_]]; j <- match(all_labels[k], r$labels)
+      if (!is.na(j)) { pts <- c(pts, r$point[j]); drs[[length(drs) + 1]] <- r$draws[, j]; groups[k] <- r$groups[j] }
+    }
+    pooled_point[k] <- mean(pts, na.rm = TRUE)
+    pooled_draws[, k] <- rowMeans(do.call(cbind, drs), na.rm = TRUE)
+  }
+  pooled <- boot_summarise(all_labels, groups, pooled_point, pooled_draws)
+  list(pooled = pooled, by_crop = by_crop)
+}
+
+if (!exists("SKIP_BOOTSTRAP") || !SKIP_BOOTSTRAP) {
+  boot_res <- run_bootstrap_all()
+  write_xlsx(list(pooled_over_crops = boot_res$pooled, by_crop = boot_res$by_crop),
+             file.path(OUTPUT_DIR, "bootstrap_CI_ALL_CROPS.xlsx"))
+  cat("\n\n==== POOLED (8 crops, equal weight) — 95% country-block bootstrap CIs ====\n")
+  print(boot_res$pooled[!grepl("^skill ", boot_res$pooled$contrast), ], digits = 3, row.names = FALSE)
+  cat("\nSaved: bootstrap_CI_ALL_CROPS.xlsx in", OUTPUT_DIR, "\n")
+}
